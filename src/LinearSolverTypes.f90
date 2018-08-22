@@ -78,7 +78,16 @@ MODULE LinearSolverTypes
 #ifdef FUTILITY_HAVE_Trilinos
   USE ForTeuchos_ParameterList
 #endif
-  IMPLICIT NONE
+#ifdef FUTILITY_HAVE_ForTrilinos
+#include "ForTrilinos.h"
+
+  USE iso_c_binding
+  USE forteuchos
+  USE fortpetra
+  USE fortrilinos
+#endif
+
+IMPLICIT NONE
 
 #ifdef FUTILITY_HAVE_PETSC
 #include <finclude/petsc.h>
@@ -151,7 +160,14 @@ MODULE LinearSolverTypes
     INTEGER(SIK) :: Belos_pc
     LOGICAL(SBK) :: belos_pc_set=.TRUE.
 #endif
-  !
+#ifdef FUTILITY_HAVE_ForTrilinos
+    !> Teuchos communicator
+    TYPE(TeuchosComm) :: Tcomm
+    !> Anasazi Eigenvalue Solver type
+    TYPE(TrilinosSolver) :: sol
+    !> Teuchos parameter list for solver
+    TYPE(ParameterList) :: TplSolver
+#endif
   !List of Type Bound Procedures
     CONTAINS
       !> Deferred routine for initializing the linear solver system
@@ -308,6 +324,10 @@ MODULE LinearSolverTypes
       TYPE(ParamType) :: belosParams
       TYPE(ForTeuchos_ParameterList_ID) :: plID
 #endif
+#ifdef FUTILITY_HAVE_ForTrilinos
+     TYPE(ParameterList) :: sublist
+     LOGICAL(C_BOOL)::true=.true.
+#endif
       !Check to set up required and optional param lists.
       IF(.NOT.LinearSolverType_Paramsflag) CALL LinearSolverType_Declare_ValidParams()
 
@@ -361,6 +381,10 @@ MODULE LinearSolverTypes
       !Initialize parallel environments based on input
       IF(MPI_Comm_ID /= -1) CALL solver%MPIparallelEnv%init(MPI_Comm_ID)
       IF(numberOMP > 0) CALL solver%OMPparallelEnv%init(numberOMP)
+
+#ifdef FUTILITY_HAVE_ForTrilinos
+      solver%Tcomm = TeuchosComm(solver%MPIparallelEnv%comm)
+#endif
 
       IF(.NOT.solver%isInit) THEN
         solver%info=0
@@ -629,6 +653,31 @@ MODULE LinearSolverTypes
                 SELECTTYPE(b=>solver%b); TYPE IS(TrilinosVectorType)
                   CALL Belos_Setb(solver%Belos_solver,b%b)
                 ENDSELECT
+#elif FUTILITY_HAVE_ForTrilinos
+                IF(solverMethod/=GMRES) &
+                  CALL eLinearSolverType%raiseError('Incorrect call to '// &
+                      modName//'::'//myName//' - Only GMRES solver is supported with Trilinos')
+                
+                ! setup parameter lists
+                solver%TplSolver = ParameterList("belos")
+                CALL solver%TplSolver%set('Linear Solver Type','Belos')
+                CALL solver%TplSolver%set('Preconditioner Type','Ifpack2')
+
+                sublist = solver%TplSolver%sublist('Belos')
+                sublist = sublist%sublist('Linear Solver Types')
+                sublist = sublist%sublist('Belos')
+                CALL sublist%set('Solver Type','Block GMRES')
+                sublist = sublist%sublist('Solver Types')
+                sublist = sublist%sublist('Block GMRES')
+                CALL sublist%set('Block Size',1)
+                CALL sublist%set('Convergence Tolerance',1.0d-4)
+                CALL sublist%set('Maximum Iterations',20)
+                CALL sublist%set('Output Frequency',1)
+                CALL sublist%set('Show Maximum Residual Norm Only',true)
+                call sublist%release()
+
+                solver%sol = TrilinosSolver()
+                call solver%sol%init(solver%Tcomm)
 #else
                 CALL eLinearSolverType%raiseError('Incorrect call to '// &
                   modName//'::'//myName//' - invalid value of solverMethod')
@@ -768,7 +817,11 @@ MODULE LinearSolverTypes
       IF(solver%TPLType==PETSC .AND. solver%isInit) &
         CALL KSPDestroy(solver%ksp,ierr)
 #endif
-
+#ifdef FUTILITY_HAVE_ForTrilinos
+      CALL solver%sol%release()
+      CALL solver%Tcomm%release()
+      CALL solver%TplSolver%release()
+#endif
       CALL solver%MPIparallelEnv%clear()
       CALL solver%OMPparallelEnv%clear()
       IF(ASSOCIATED(solver%X)) THEN
@@ -1144,6 +1197,33 @@ MODULE LinearSolverTypes
                 ! solve
                 CALL Belos_solve(solver%Belos_solver)
 #endif
+#ifdef FUTILITY_HAVE_ForTrilinos
+              TYPE IS(TrilinosMatrixType)
+                ! assemble matrix if necessary
+                IF(.NOT.(A%isAssembled)) CALL A%assemble()
+
+                ! assemble source vector if necessary
+                SELECTTYPE(b=>solver%b); TYPE IS(TrilinosVectorType)
+                  IF(.NOT.(b%isAssembled)) CALL b%assemble()
+                ENDSELECT
+
+                ! assemble solution vector if necessary
+                SELECTTYPE(X=>solver%X); TYPE IS(TrilinosVectorType)
+                  IF(.NOT.(X%isAssembled)) CALL X%assemble()
+                ENDSELECT
+
+
+                call solver%sol%setup_matrix(A%A)
+                call solver%sol%setup_solver(solver%TplSolver)
+                ! solve
+                SELECTTYPE(b=>solver%b); TYPE IS(TrilinosVectorType)
+                  SELECTTYPE(X=>solver%X); TYPE IS(TrilinosVectorType)
+                    CALL solver%sol%solve(b%b,X%b)
+                  ENDSELECT
+                ENDSELECT
+
+#endif
+
               CLASS DEFAULT
                 IF(solver%pciters /= 0) THEN
                   CALL solveGMRES(solver,solver%PreCondType)
@@ -1266,6 +1346,10 @@ MODULE LinearSolverTypes
       PetscReal :: dtol=PETSC_DEFAULT_DOUBLE_PRECISION
 #endif
 #endif
+     
+#ifdef FUTILITY_HAVE_ForTrilinos
+      TYPE(ParameterList)::sublist
+#endif
 
       INTEGER(SIK) :: normType,maxIters,nRestart
       REAL(SRK) :: convTol
@@ -1321,6 +1405,14 @@ MODULE LinearSolverTypes
         ELSEIF(solver%TPLType == TRILINOS) THEN
 #ifdef FUTILITY_HAVE_Trilinos
           CALL Belos_SetConvCrit(solver%Belos_solver,solver%convTol,solver%maxIters)
+#elif FUTILITY_HAVE_ForTrilinos
+          sublist = solver%TplSolver%sublist('Linear Solver Types')
+          sublist = sublist%sublist('Belos')
+          sublist = sublist%sublist('Solver Types')
+          sublist = sublist%sublist('Block GMRES')
+          CALL sublist%set('Maximum Iterations',solver%maxIters)
+          CALL sublist%set('Convergence Tolerance',solver%convTol)
+          CALL sublist%release()
 #else
           CALL eLinearSolverType%raiseFatalError('Incorrect call to '// &
              modName//'::'//myName//' - Trilinos not enabled.  You will'// &
